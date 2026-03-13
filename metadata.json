@@ -1,0 +1,5 @@
+{
+  "name": "AI Terminal",
+  "description": "An AI-powered terminal application that can generate and save projects.",
+  "requestFramePermissions": []
+}
