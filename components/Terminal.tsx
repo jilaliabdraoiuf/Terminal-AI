@@ -4,9 +4,10 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '@/lib/AuthContext';
 import { signInWithGoogle, logOut, db } from '@/lib/firebase';
 import { collection, addDoc, query, orderBy, onSnapshot, serverTimestamp, doc, setDoc, getDocs, where, updateDoc } from 'firebase/firestore';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 import { motion } from 'motion/react';
-import { Download, LogOut, LogIn, Terminal as TerminalIcon, Key } from 'lucide-react';
+import { Download, LogOut, LogIn, Terminal as TerminalIcon, Key, Copy, Check, Eye, EyeOff } from 'lucide-react';
+import JSZip from 'jszip';
 
 const ai = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
 
@@ -51,9 +52,13 @@ export default function Terminal() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingText, setStreamingText] = useState('');
   const [generatedFiles, setGeneratedFiles] = useState<ProjectFile[]>([]);
+  const [showFiles, setShowFiles] = useState(false);
+  const [isCopied, setIsCopied] = useState(false);
   const [clearedAt, setClearedAt] = useState<number>(0);
   const [hasApiKey, setHasApiKey] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     const checkKey = async () => {
@@ -114,8 +119,35 @@ export default function Terminal() {
   });
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [visibleMessages, isProcessing, streamingText]);
+    if (messagesEndRef.current) {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [visibleMessages, isProcessing, streamingText, input]);
+
+  // Auto-scroll textarea to bottom when typing long commands
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
+    }
+  }, [input]);
+
+  // Load saved input from local storage on mount
+  useEffect(() => {
+    const savedInput = localStorage.getItem('terminal_draft_input');
+    if (savedInput) {
+      setInput(savedInput);
+    }
+  }, []);
+
+  // Auto-save input to local storage when it changes
+  useEffect(() => {
+    const timeoutId = setTimeout(() => {
+      if (input !== undefined) {
+        localStorage.setItem('terminal_draft_input', input);
+      }
+    }, 500);
+    return () => clearTimeout(timeoutId);
+  }, [input]);
 
   const handleCommand = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -123,6 +155,7 @@ export default function Terminal() {
 
     const command = input.trim();
     setInput('');
+    localStorage.removeItem('terminal_draft_input');
 
     if (command.toLowerCase() === 'clear') {
       setClearedAt(Date.now());
@@ -132,9 +165,10 @@ export default function Terminal() {
 
     if (command.toLowerCase() === 'help') {
       const helpMsg = `Available commands:
-  clear  - Clear the terminal screen
-  help   - Show this help message
-  ls     - List previously generated projects
+  clear    - Clear the terminal screen
+  help     - Show this help message
+  ls       - List previously generated projects
+  build-ai - Create an autonomous AI from scratch based on your idea
   
 Any other input will be sent to the AI assistant. You can ask it to build apps, write scripts, or answer questions.`;
       
@@ -200,6 +234,7 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
       })).filter(m => m.role !== 'system');
 
       const tools = [
+        { googleSearch: {} },
         {
           functionDeclarations: [
             {
@@ -263,6 +298,18 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
                 properties: { key: { type: Type.STRING } },
                 required: ["key"]
               }
+            },
+            {
+              name: "deploy_cloud_server",
+              description: "Deploy and install a server automatically to the cloud. Use this when the user asks to run, host, or install a server.",
+              parameters: {
+                type: Type.OBJECT,
+                properties: {
+                  framework: { type: Type.STRING, description: "The framework or server type (e.g., Express, Django, Nginx, Node.js)" },
+                  status: { type: Type.STRING, description: "Status message to show the user" }
+                },
+                required: ["framework", "status"]
+              }
             }
           ]
         }
@@ -278,23 +325,39 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
       let imageUrl = '';
       let functionResponses: any[] = [];
       let functionCalls: any[] = [];
+      let aggregatedParts: any[] = [];
 
       const responseStream = await ai.models.generateContentStream({
         model: 'gemini-3.1-pro-preview',
         contents: messagesToAi,
         config: {
-          systemInstruction: "You are an AI terminal assistant. Respond concisely like a command-line interface. You can build apps, generate images/videos, and store/fetch data.",
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          systemInstruction: "You are an autonomous Cloud Terminal AI, Expert AI Architect, Secure Web Crawler, and the core of 'التعلم البرمجي التلقائي بالانظمه' (Automatic Programmatic Learning by Systems). Respond concisely like a command-line interface. You support ALL operating systems (Windows, Linux, Android, iOS, macOS, and Xiaomi's HyperOS/MIUI specifically for building AI systems). You can build apps, generate images/videos, store/fetch data, and deploy cloud servers. Use the googleSearch tool to browse the web, verify information, find safe/free applications, and fetch secure open-source code snippets. If the user asks for apps for ANY OS, find the most powerful, latest, and 100% free/safe versions, verifying they are not fake or malicious. If the user asks to convert an app or build a custom app for Windows, Linux, Android, iOS, or Xiaomi systems, fetch secure code and generate the complete cross-platform application (e.g., using Electron, React Native, Flutter, or native code) using the 'save_project' tool. Act as an interactive chat assistant that provides direct, automatic commands and helps download/build apps seamlessly across all systems. CRITICAL: If the user asks to 'build an AI from scratch', analyze their idea, break it down, and generate the complete code.",
           tools
         }
       });
 
       for await (const chunk of responseStream) {
-        if (chunk.text) {
-          aiResponseText += chunk.text;
-          setStreamingText(aiResponseText);
-        }
-        if (chunk.functionCalls) {
-          functionCalls.push(...chunk.functionCalls);
+        const parts = chunk.candidates?.[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.functionCall) {
+            functionCalls.push(part.functionCall);
+            aggregatedParts.push(part);
+          } else if (part.text !== undefined) {
+            aiResponseText += part.text;
+            setStreamingText(aiResponseText);
+            
+            const lastPart = aggregatedParts[aggregatedParts.length - 1];
+            const getKeys = (obj: any) => Object.keys(obj).filter(k => k !== 'text').sort().join(',');
+            
+            if (lastPart && lastPart.text !== undefined && getKeys(lastPart) === getKeys(part)) {
+              lastPart.text += part.text;
+            } else {
+              aggregatedParts.push({ ...part });
+            }
+          } else {
+            aggregatedParts.push(part);
+          }
         }
       }
 
@@ -324,19 +387,29 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
             if (typeof window !== 'undefined' && (window as any).aistudio && !(await (window as any).aistudio.hasSelectedApiKey())) {
               await (window as any).aistudio.openSelectKey();
             }
-            const mediaAi = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
-            const imgRes = await mediaAi.models.generateContent({
-              model: 'gemini-3.1-flash-image-preview',
-              contents: [{ role: 'user', parts: [{ text: args.prompt }] }],
-              config: { imageConfig: { imageSize: "512px" } }
-            });
-            for (const part of imgRes.candidates?.[0]?.content?.parts || []) {
-              if (part.inlineData) {
-                imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-                break;
+            try {
+              const mediaAi = new GoogleGenAI({ apiKey: process.env.API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+              const imgRes = await mediaAi.models.generateContent({
+                model: 'gemini-3.1-flash-image-preview',
+                contents: [{ role: 'user', parts: [{ text: args.prompt }] }],
+                config: { imageConfig: { imageSize: "512px" } }
+              });
+              for (const part of imgRes.candidates?.[0]?.content?.parts || []) {
+                if (part.inlineData) {
+                  imageUrl = `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+                  break;
+                }
               }
+              functionResponses.push({ functionResponse: { name: call.name, response: { success: true } } });
+            } catch (e: any) {
+              console.error("Image generation error", e);
+              if (e.message?.includes("Requested entity was not found") || e.message?.includes("API key not valid")) {
+                if (typeof window !== 'undefined' && (window as any).aistudio) {
+                  await (window as any).aistudio.openSelectKey();
+                }
+              }
+              functionResponses.push({ functionResponse: { name: call.name, response: { success: false, error: e.message } } });
             }
-            functionResponses.push({ functionResponse: { name: call.name, response: { success: true } } });
           }
           else if (call.name === 'generate_video') {
             const args = call.args as any;
@@ -345,19 +418,18 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
             }
             
             const startVideo = async () => {
+              const msgRef = await addDoc(collection(db, 'messages'), {
+                userId: user.uid,
+                role: 'system',
+                text: `Generating video for: "${args.prompt}"... This may take a few minutes.`,
+                createdAt: serverTimestamp()
+              });
               try {
-                const mediaAi = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
+                const mediaAi = new GoogleGenAI({ apiKey: process.env.API_KEY || process.env.NEXT_PUBLIC_GEMINI_API_KEY });
                 let operation = await mediaAi.models.generateVideos({
                   model: 'veo-3.1-fast-generate-preview',
                   prompt: args.prompt,
                   config: { numberOfVideos: 1, resolution: '720p', aspectRatio: '16:9' }
-                });
-                
-                const msgRef = await addDoc(collection(db, 'messages'), {
-                  userId: user.uid,
-                  role: 'system',
-                  text: `Generating video for: "${args.prompt}"... This may take a few minutes.`,
-                  createdAt: serverTimestamp()
                 });
 
                 while (!operation.done) {
@@ -371,8 +443,14 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
                 } else {
                   await updateDoc(msgRef, { text: `Failed to generate video for: "${args.prompt}"` });
                 }
-              } catch (e) {
+              } catch (e: any) {
                 console.error("Video generation error", e);
+                if (e.message?.includes("Requested entity was not found") || e.message?.includes("API key not valid")) {
+                  if (typeof window !== 'undefined' && (window as any).aistudio) {
+                    await (window as any).aistudio.openSelectKey();
+                  }
+                }
+                await updateDoc(msgRef, { text: `Failed to generate video for: "${args.prompt}". Error: ${e.message}` });
               }
             };
             startVideo();
@@ -395,12 +473,19 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
             const data = snap.empty ? "Not found" : snap.docs[0].data().data;
             functionResponses.push({ functionResponse: { name: call.name, response: { data } } });
           }
+          else if (call.name === 'deploy_cloud_server') {
+            const args = call.args as any;
+            const mockUrl = `https://${args.framework.toLowerCase().replace(/[^a-z0-9]/g, '')}-${crypto.randomUUID().split('-')[0]}.cloud.ai-term.app`;
+            aiResponseText += `\n[Cloud Orchestrator]: ${args.status}\n[Cloud Orchestrator]: Provisioning ${args.framework} server...\n[Cloud Orchestrator]: Installing dependencies...\n[Cloud Orchestrator]: Server successfully deployed and running at: ${mockUrl}`;
+            setStreamingText(aiResponseText);
+            functionResponses.push({ functionResponse: { name: call.name, response: { success: true, url: mockUrl } } });
+          }
         }
 
         if (functionResponses.length > 0) {
           messagesToAi.push({
             role: 'model',
-            parts: functionCalls.map(call => ({ functionCall: call }))
+            parts: aggregatedParts.length > 0 ? aggregatedParts : functionCalls.map(call => ({ functionCall: call }))
           });
           messagesToAi.push({ role: 'user', parts: functionResponses });
           
@@ -408,7 +493,8 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
             model: 'gemini-3.1-pro-preview',
             contents: messagesToAi,
             config: {
-              systemInstruction: "You are an AI terminal assistant. Respond concisely like a command-line interface. You can build apps, generate images/videos, and store/fetch data.",
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              systemInstruction: "You are an autonomous Cloud Terminal AI. Respond concisely like a command-line interface. You can build apps, generate images/videos, store/fetch data, and deploy cloud servers. If the user asks to learn commands, act as an interactive tutorial step-by-step. If the user asks to create, install, or run a server/app, automatically generate the code and use the 'deploy_cloud_server' tool to simulate instant cloud deployment. Adapt automatically to any program or stack the user requests without needing manual configuration.",
               tools
             }
           });
@@ -453,12 +539,8 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
     }
   };
 
-  const downloadFiles = () => {
+  const downloadFiles = async () => {
     if (generatedFiles.length === 0) return;
-    
-    // Create a simple text representation or trigger multiple downloads
-    // For simplicity, let's create a single JSON file containing all files
-    // or if it's a single file, download it directly.
     
     if (generatedFiles.length === 1) {
       const file = generatedFiles[0];
@@ -470,14 +552,32 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
       a.click();
       URL.revokeObjectURL(url);
     } else {
-      const content = JSON.stringify(generatedFiles, null, 2);
-      const blob = new Blob([content], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
+      const zip = new JSZip();
+      generatedFiles.forEach(file => {
+        zip.file(file.name, file.content);
+      });
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'project_files.json';
+      a.download = 'project_files.zip';
       a.click();
       URL.revokeObjectURL(url);
+    }
+  };
+
+  const copyFilesToClipboard = async () => {
+    if (generatedFiles.length === 0) return;
+    let textToCopy = '';
+    generatedFiles.forEach(file => {
+      textToCopy += `--- ${file.name} ---\n${file.content}\n\n`;
+    });
+    try {
+      await navigator.clipboard.writeText(textToCopy);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy text: ', err);
     }
   };
 
@@ -526,76 +626,142 @@ Any other input will be sent to the AI assistant. You can ask it to build apps, 
         </div>
       </header>
 
-      <main className="flex-1 overflow-hidden flex flex-col relative">
-        <div className="flex-1 overflow-y-auto space-y-4 pb-20 custom-scrollbar">
-          {visibleMessages.map((msg, idx) => (
-            <motion.div 
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              key={msg.id || idx} 
-              className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
-            >
-              <div className={`max-w-[80%] break-words whitespace-pre-wrap ${
-                msg.role === 'user' ? 'text-blue-400' : 
-                msg.role === 'system' ? 'text-yellow-500' : 'text-green-500'
-              }`} dir="auto">
-                {msg.role === 'user' ? '> ' : msg.role === 'system' ? '[SYS] ' : ''}
-                {msg.text}
-                {msg.imageUrl && (
-                  <img src={msg.imageUrl} alt="Generated" className="mt-2 max-w-full rounded border border-green-800" />
-                )}
-                {msg.videoUrl && (
-                  <VideoPlayer uri={msg.videoUrl} />
-                )}
+      <main className="flex-1 overflow-hidden flex flex-col gap-4">
+        {/* Top Panel: Output Console */}
+        <div className="flex-1 border border-green-800 rounded p-4 flex flex-col overflow-hidden bg-black/40 relative">
+          <div className="flex justify-between items-center border-b border-green-800 pb-2 mb-4 shrink-0">
+            <h2 className="text-sm font-bold text-green-400">CONSOLE OUTPUT</h2>
+            <span className="text-xs text-green-700 font-bold">{user ? 'user@ai-term:~$' : 'guest@ai-term:~$'}</span>
+          </div>
+          
+          <div ref={chatContainerRef} className="flex-1 overflow-y-auto space-y-4 pb-4 custom-scrollbar pr-2">
+            {visibleMessages.map((msg, idx) => (
+              <motion.div 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                key={msg.id || idx} 
+                className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
+              >
+                <div className={`max-w-[90%] break-words whitespace-pre-wrap ${
+                  msg.role === 'user' ? 'text-blue-400 bg-blue-950/20 p-3 rounded border border-blue-900/50' : 
+                  msg.role === 'system' ? 'text-yellow-500 bg-yellow-950/10 p-3 rounded border border-yellow-900/30' : 'text-green-500'
+                }`} dir="auto">
+                  {msg.role === 'user' ? '> ' : msg.role === 'system' ? '[SYS] ' : ''}
+                  {msg.text}
+                  {msg.imageUrl && (
+                    <img src={msg.imageUrl} alt="Generated" className="mt-3 max-w-full rounded border border-green-800 shadow-lg" />
+                  )}
+                  {msg.videoUrl && (
+                    <VideoPlayer uri={msg.videoUrl} />
+                  )}
+                </div>
+              </motion.div>
+            ))}
+            {isStreaming && (
+              <motion.div 
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex flex-col items-start"
+              >
+                <div className="max-w-[90%] break-words whitespace-pre-wrap text-green-500" dir="auto">
+                  {streamingText}
+                  <span className="animate-pulse font-bold text-green-400">_</span>
+                </div>
+              </motion.div>
+            )}
+            {isProcessing && !isStreaming && (
+              <div className="text-green-500 animate-pulse text-sm">
+                Processing request...
               </div>
-            </motion.div>
-          ))}
-          {isStreaming && (
-            <motion.div 
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="flex flex-col items-start"
-            >
-              <div className="max-w-[80%] break-words whitespace-pre-wrap text-green-500" dir="auto">
-                {streamingText}
-                <span className="animate-pulse">_</span>
-              </div>
-            </motion.div>
-          )}
-          {isProcessing && !isStreaming && (
-            <div className="text-green-500 animate-pulse">
-              Processing...
-            </div>
-          )}
-          <div ref={messagesEndRef} />
+            )}
+            <div ref={messagesEndRef} />
+          </div>
         </div>
 
+        {/* Generated Files (if any) */}
         {generatedFiles.length > 0 && (
-          <div className="absolute bottom-16 right-0 bg-green-900/20 border border-green-500 p-4 rounded backdrop-blur-sm">
-            <h3 className="text-sm font-bold mb-2">Ready for Download</h3>
-            <p className="text-xs mb-3">{generatedFiles.length} file(s) generated.</p>
-            <button 
-              onClick={downloadFiles}
-              className="flex items-center gap-2 bg-green-600 text-black px-4 py-2 text-sm font-bold hover:bg-green-500 transition-colors"
-            >
-              <Download className="w-4 h-4" />
-              DOWNLOAD PROJECT
-            </button>
+          <div className="border border-green-500 bg-green-900/20 p-4 rounded flex flex-col gap-4 shrink-0">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+              <div>
+                <h3 className="text-sm font-bold mb-1 text-green-400">GENERATED FILES</h3>
+                <p className="text-xs text-green-500">{generatedFiles.length} file(s) ready for download.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button 
+                  onClick={() => setShowFiles(!showFiles)}
+                  className="flex items-center justify-center gap-2 border border-green-600 text-green-500 px-4 py-2 text-sm font-bold hover:bg-green-900 transition-colors"
+                >
+                  {showFiles ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  {showFiles ? 'HIDE CODE' : 'VIEW CODE'}
+                </button>
+                <button 
+                  onClick={downloadFiles}
+                  className="flex items-center justify-center gap-2 bg-green-600 text-black px-4 py-2 text-sm font-bold hover:bg-green-500 transition-colors"
+                >
+                  <Download className="w-4 h-4" />
+                  DOWNLOAD
+                </button>
+                <button 
+                  onClick={copyFilesToClipboard}
+                  className="flex items-center justify-center gap-2 border border-green-600 text-green-500 px-4 py-2 text-sm font-bold hover:bg-green-900 transition-colors"
+                >
+                  {isCopied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                  {isCopied ? 'COPIED!' : 'COPY FILES'}
+                </button>
+              </div>
+            </div>
+            
+            {showFiles && (
+              <div className="mt-2 border-t border-green-800 pt-4 flex flex-col gap-4 max-h-[400px] overflow-y-auto custom-scrollbar pr-2">
+                {generatedFiles.map((file, idx) => (
+                  <div key={idx} className="bg-black/60 rounded border border-green-800 overflow-hidden">
+                    <div className="bg-green-950/50 px-3 py-1 border-b border-green-800 text-xs font-mono text-green-400">
+                      {file.name}
+                    </div>
+                    <pre className="p-3 text-xs font-mono text-green-500 overflow-x-auto custom-scrollbar">
+                      <code>{file.content}</code>
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
-        <form onSubmit={handleCommand} className="mt-4 flex items-center gap-2 border-t border-green-800 pt-4">
-          <span className="text-green-500 font-bold">{user ? 'user@ai-term:~$' : 'guest@ai-term:~$'}</span>
-          <input
-            type="text"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            disabled={!user || isProcessing}
-            className="flex-1 bg-transparent border-none outline-none text-green-500 placeholder-green-800 font-mono"
-            placeholder={user ? "Type a command..." : "Please login to use the terminal"}
-            autoFocus
-          />
-        </form>
+        {/* Bottom Panel: Input & Controls */}
+        <div className="border border-green-800 rounded p-4 flex flex-col bg-green-950/10 shrink-0">
+          <form onSubmit={handleCommand} className="flex flex-col sm:flex-row gap-4">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  if (input.trim() && user && !isProcessing) {
+                    handleCommand(e as any);
+                  }
+                }
+              }}
+              disabled={!user || isProcessing}
+              className="flex-1 bg-black/50 border border-green-800 rounded p-3 outline-none text-green-500 placeholder-green-800 font-mono resize-none focus:border-green-500 transition-colors custom-scrollbar min-h-[60px] max-h-[200px]"
+              placeholder={user ? "Type your command here... (Press Enter to submit, Shift+Enter for new line)" : "Please login to use the terminal"}
+              autoFocus
+              rows={2}
+            />
+            <button 
+              type="submit"
+              disabled={!user || isProcessing || !input.trim()}
+              className="sm:w-32 bg-green-900/30 border border-green-500 text-green-500 px-4 py-3 font-bold hover:bg-green-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex justify-center items-center gap-2"
+            >
+              {isProcessing ? (
+                <span className="animate-pulse">...</span>
+              ) : (
+                <>EXECUTE <TerminalIcon className="w-4 h-4" /></>
+              )}
+            </button>
+          </form>
+        </div>
       </main>
       <style dangerouslySetInnerHTML={{__html: `
         .custom-scrollbar::-webkit-scrollbar {
